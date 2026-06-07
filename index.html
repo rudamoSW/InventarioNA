@@ -11,6 +11,8 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;background:#f4f0ea;-webkit-text-size-adjust:100%}
@@ -99,29 +101,32 @@ const C = {
   wa:'#25D366', danger:'#b91c1c', dangerBg:'#fef2f2',
 };
 
-const SK = 'tna-v5';
+/* ─── FIREBASE ─── */
+const firebaseConfig = {
+  apiKey: "AIzaSyDaMgo7j5KABhl9iFYDkOkrbsRjSDKcb4A",
+  authDomain: "taberna-nuevo-ancla-bf4b7.firebaseapp.com",
+  databaseURL: "https://taberna-nuevo-ancla-bf4b7-default-rtdb.firebaseio.com",
+  projectId: "taberna-nuevo-ancla-bf4b7",
+  storageBucket: "taberna-nuevo-ancla-bf4b7.firebasestorage.app",
+  messagingSenderId: "1084588755409",
+  appId: "1:1084588755409:web:c29065a93b89112be4b8f0"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+const DB_REF = 'taberna';
 
-function loadData() {
-  try {
-    const s = localStorage.getItem(SK);
-    if (s) return JSON.parse(s);
-    // Migrar desde v4
-    const old = localStorage.getItem('tna-v4');
-    if (old) {
-      const d = JSON.parse(old);
-      const catNames = [...new Set((d.products||[]).map(p => p.cat).filter(Boolean))];
-      return {
-        products: d.products,
-        suppliers: (d.suppliers||[]).map(s => ({ ...s, wa: s.wa || '' })),
-        categories: catNames.map((name, i) => ({ id: i + 1, name }))
-      };
-    }
-  } catch(_) {}
-  return null;
-}
-
-function saveData(data) {
-  try { localStorage.setItem(SK, JSON.stringify(data)); } catch(_) {}
+function processProducts(savedProds) {
+  if (!savedProds || !Array.isArray(savedProds)) {
+    return INITIAL_PRODUCTS.map(p => ({ ...p, cat: '', sup: '', status: null, orderQty: '' }));
+  }
+  const map = Object.fromEntries(savedProds.map(p => [p.id, p]));
+  const base = INITIAL_PRODUCTS.map(p =>
+    map[p.id]
+      ? { ...p, name: map[p.id].name || p.name, cat: map[p.id].cat || '', sup: map[p.id].sup || '', status: map[p.id].status ?? null, orderQty: map[p.id].orderQty || '' }
+      : { ...p, cat: '', sup: '', status: null, orderQty: '' }
+  );
+  const extra = savedProds.filter(p => !INITIAL_PRODUCTS.find(i => i.id === p.id));
+  return [...base, ...extra];
 }
 
 function buildMsg(items) {
@@ -141,39 +146,13 @@ function WaIcon({ size = 16 }) {
 
 /* ─── APP ─── */
 function App() {
-  const [products, setProducts] = useState(() => {
-    const saved = loadData();
-    if (saved && saved.products) {
-      const map = Object.fromEntries(saved.products.map(p => [p.id, p]));
-      const base = INITIAL_PRODUCTS.map(p =>
-        map[p.id]
-          ? { ...p, name: map[p.id].name || p.name, cat: map[p.id].cat || '', sup: map[p.id].sup || '', status: map[p.id].status, orderQty: map[p.id].orderQty || '' }
-          : { ...p, cat: '', sup: '', status: null, orderQty: '' }
-      );
-      const extra = saved.products.filter(p => !INITIAL_PRODUCTS.find(i => i.id === p.id));
-      return [...base, ...extra];
-    }
-    return INITIAL_PRODUCTS.map(p => ({ ...p, cat: '', sup: '', status: null, orderQty: '' }));
-  });
+  const [products,   setProducts]   = useState(INITIAL_PRODUCTS.map(p => ({ ...p, cat: '', sup: '', status: null, orderQty: '' })));
+  const [suppliers,  setSuppliers]  = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [loading,    setLoading]    = useState(true);   // espera carga inicial de Firebase
 
-  const [suppliers, setSuppliers] = useState(() => {
-    const saved = loadData();
-    return saved && saved.suppliers ? saved.suppliers.map(s => ({ ...s, wa: s.wa || '' })) : [];
-  });
-
-  const [categories, setCategories] = useState(() => {
-    const saved = loadData();
-    const base = saved && saved.categories ? saved.categories : [];
-    // Sincronizar categorías de productos que no estén en la lista
-    const prods = (saved && saved.products) ? saved.products : [];
-    const prodCats = [...new Set(prods.map(p => p.cat).filter(Boolean))];
-    const merged = [...base];
-    prodCats.forEach(name => {
-      if (!merged.find(c => c.name === name))
-        merged.push({ id: Date.now() + merged.length, name });
-    });
-    return merged;
-  });
+  const lastSent      = useRef(null);   // evita loop: no re-escribe lo que acabamos de leer
+  const isStarting    = useRef(true);   // bloquea escrituras hasta recibir datos iniciales
 
   const [view, setView]           = useState('list');
   const [search, setSearch]       = useState('');
@@ -194,7 +173,39 @@ function App() {
     }
   }, [view]);
 
-  useEffect(() => { saveData({ products, suppliers, categories }); }, [products, suppliers, categories]);
+  /* ── Firebase: escuchar cambios en tiempo real ── */
+  useEffect(() => {
+    const ref = db.ref(DB_REF);
+    ref.on('value', snapshot => {
+      const data = snapshot.val();
+      if (data) {
+        const json = JSON.stringify(data);
+        if (json !== lastSent.current) {
+          // Dato nuevo de otro dispositivo (o carga inicial)
+          const prods = processProducts(data.products);
+          const sups  = (data.suppliers  || []).map(s => ({ ...s, wa: s.wa || '' }));
+          const cats  = data.categories || [];
+          setProducts(prods);
+          setSuppliers(sups);
+          setCategories(cats);
+          lastSent.current = json;
+        }
+      }
+      // Primera carga lista
+      if (isStarting.current) { isStarting.current = false; setLoading(false); }
+    });
+    return () => ref.off();
+  }, []);
+
+  /* ── Firebase: guardar cuando cambia el estado local ── */
+  useEffect(() => {
+    if (isStarting.current) return;          // aún no recibimos datos iniciales
+    const data = { products, suppliers, categories };
+    const json = JSON.stringify(data);
+    if (json === lastSent.current) return;   // es lo que ya teníamos, no reescribir
+    lastSent.current = json;
+    db.ref(DB_REF).set(data);
+  }, [products, suppliers, categories]);
 
   const allCats = useMemo(() => {
     const fromCats = categories.map(c => c.name);
@@ -336,6 +347,17 @@ function App() {
     { id: 'suppliers',  label: 'Proveedores' },
     { id: 'categories', label: 'Categorías' },
   ];
+
+  if (loading) return (
+    <div style={{ minHeight:'100vh', background:C.bg, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:'16px' }}>
+      <div style={{ fontSize:'10px', letterSpacing:'0.2em', color:C.muted, textTransform:'uppercase' }}>Taberna</div>
+      <div style={{ fontSize:'22px', fontFamily:"'Lora',Georgia,serif", color:C.text }}>Nuevo Ancla</div>
+      <div style={{ width:'48px', height:'3px', background:C.divider, borderRadius:'3px', overflow:'hidden', marginTop:'8px' }}>
+        <div style={{ height:'100%', width:'40%', background:C.amberBtn, borderRadius:'3px', animation:'tnaslide 1s infinite ease-in-out' }} />
+      </div>
+      <style>{`@keyframes tnaslide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}`}</style>
+    </div>
+  );
 
   return (
     <div style={{ minHeight: '100vh', background: C.bg, color: C.text, fontFamily: "'DM Sans',system-ui,sans-serif", paddingBottom: '68px' }}>
